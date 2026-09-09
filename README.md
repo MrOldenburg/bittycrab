@@ -35,7 +35,8 @@ output).
 
 | Config | Speed | Steady RAM | Accuracy |
 |---|---|---|---|
-| Mojo baseline (starting point) | 40.17 tok/s | ~956 MB | reference |
+| bitnet.cpp (upstream reference) | ~30-40 tok/s | ~1.1-1.2 GB | reference |
+| Mojo baseline (this project's starting point) | 40.17 tok/s | ~956 MB | reference |
 | **Rust, default (int8 lm_head + PLD)** | **~70.4 tok/s** | ~1.58 GB | **15/15 exact** |
 | **Rust, `-mem` (pread lm_head + PLD)** | **~70.2 tok/s** | **~900 MB** | **15/15 exact** |
 
