@@ -6,6 +6,27 @@ decode throughput and memory footprint as far as they'd go — with every
 number below coming from a real accuracy+speed harness, not a single
 favorable demo run.
 
+The Mojo version was built and tuned first, as a way to find out what was
+actually achievable on this hardware and where the real bottlenecks were,
+before asking whether Rust would handle the same problem differently —
+specifically, whether Rust's threading would carry less overhead than
+Mojo's.
+
+One concrete finding from that comparison: **thread-count tuning behaved
+completely differently between the two.** The Mojo engine's throughput kept
+climbing as more threads were added, all the way out to all 24 physical
+cores — including the E-cores, which are meaningfully slower per-thread
+than the P-cores. Porting the same workload to Rust changed that: the
+optimal thread count dropped to around 8, matching the number BitNet's own
+paper reports as its useful ceiling — past that, Rust's throughput flattens
+or gets noisy rather than continuing to climb. That's not Rust being
+"faster at the same job" so much as it hitting the real ceiling with less
+overhead in the way: decode here is memory-bandwidth bound (see below), so
+once you're not paying for extra thread/scheduling overhead, more threads
+past ~8 just contend for the same memory bus without doing more useful
+work — Rust's leaner threading model exposed that ceiling instead of
+letting more threads paper over it.
+
 ## Results
 
 Everything measured against the same 15-prompt harness (below), verified
@@ -56,7 +77,7 @@ Run it with:
 cargo run --release -- -mem
 ```
 
-## The lm_head/embedding table: FP16 → int8, and the K that reaches full accuracy
+## The lm_head/embedding table: FP16 → int8, and the K that holds the harness
 
 The tied embedding table doubles as both the input embedding lookup and the
 final vocabulary projection (`lm_head`). A naive implementation scans the
@@ -73,20 +94,38 @@ the candidate set, never produce a wrong final token by itself.
 
 The open question was how small K (candidates re-scored per worker) could
 go before that approximation actually cost accuracy. Swept directly against
-the 15-prompt harness:
+the 15-prompt harness (i.e. this is 100% match on those 15 prompts
+specifically, not a universal accuracy guarantee):
 
-| K (per-worker top-k) | Accuracy (15 prompts) |
+| K (per-worker top-k) | Match rate on the 15-prompt harness |
 |---|---|
 | 1 | 12/15 |
 | 2 | 14/15 |
-| **4** | **15/15 — first K that holds exact** |
+| **4** | **15/15 — first K that matches on every harness prompt** |
 | 8 | 15/15 |
 | 16 | 15/15 |
 
-**K=4 is the value shipped** — the smallest K that reaches full accuracy,
-verified by direct sweep rather than assumed. (A K=1/K=2 check against a
-single demo prompt looked safe at first — the full 15-prompt sweep is what
-caught that it wasn't.)
+**K=4 is the value shipped.**
+
+Why such a small K works at all: per the BitNet b1.58 paper, the model's
+own weights are ternary (`{-1, 0, 1}`), which means the *effective*
+precision the rest of the network actually operates at is coarse to begin
+with — the true top logits tend to sit close together rather than being
+sharply separated, so the int8-approximated ranking rarely misplaces the
+real winner by more than a few positions. That's exactly why a tiny
+re-score window (K=4) is enough to catch it essentially every time: the
+search only has to cover a small neighborhood, not the full 128k-token
+vocabulary, and re-scoring 4 candidates in exact F16 is close to free next
+to the matmul work already happening every step.
+
+That's also why this specific optimization compounds so well with
+everything else here: shrinking K shrinks exactly the thing this whole
+project kept finding was the actual constraint once the easy wins (thread
+count, dispatch overhead, kernel fusion) were exhausted — **RAM bandwidth**.
+Every decode step is bound by how many bytes of weights and table entries
+have to move off DRAM, not by spare compute; a smaller K means fewer
+candidate rows read back for re-scoring, which is a direct cut to that
+bandwidth bill rather than a clever trick around it.
 
 ## The decoder: prompt-lookup decoding (PLD)
 
